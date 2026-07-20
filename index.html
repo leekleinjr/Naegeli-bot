@@ -207,9 +207,6 @@ h3.sub{font-size:13px;color:var(--text);margin:14px 0 4px;}
   <div class="card">
     <h2>Export paperwork</h2>
     <p class="hint">Generates filled PDFs from the official blank forms. On your phone, they land in Downloads &mdash; share/save them to Google Drive from there.</p>
-    <label class="f" style="display:flex;align-items:center;gap:8px;margin-top:12px">
-      <input type="checkbox" id="optTotals" style="width:auto"> Billing sheet: use total durations instead of first-on / last-off clock times
-    </label>
     <button class="btn primary wide" id="expBillingBtn">⬇ Billing Sheet + Video Log</button>
     <button class="btn primary wide" id="expCertBtn">⬇ Videographer Certificate</button>
     <button class="btn wide" id="expBothBtn">⬇ Export both</button>
@@ -251,6 +248,8 @@ h3.sub{font-size:13px;color:var(--text);margin:14px 0 4px;}
     4. Credentials &rarr; Create Credentials &rarr; OAuth client ID &rarr; <b>Web application</b> &rarr; add this app's web address (its "origin", e.g. <code>https://yourname.github.io</code>) under Authorized JavaScript origins.<br>
     5. Paste the Client ID below. Until then, copy-paste works great.</p>
     <label class="f">OAuth Client ID</label><input type="text" id="s_clientId" placeholder="xxxx.apps.googleusercontent.com">
+    <label class="f">Assignment sender address <span class="hint">(only emails from exactly this address show up)</span></label>
+    <input type="text" id="s_sender" placeholder="schedulingteam@naegeliusa.com">
   </div>
   <div class="card">
     <h2>Identity</h2>
@@ -275,11 +274,11 @@ function parseAssignment(raw){
   const text = raw.replace(/\r/g,'').replace(/ /g,' ');
   const labels = [
     ['resource', /Resource\b\.?/],
-    ['jobNo', /Job\s*No\.?\s*:?/],
+    ['jobNo', /Job\s*(?:No\.?|#)\s*:?/],
     ['task', /Task\b\s*:?/],
     ['jobDate', /Job\s*Date\b\s*:?/],
     ['jobTime', /Job\s*Time\b\s*:?/],
-    ['witness', /Witness(?:\(es\))?\b\s*:?/],
+    ['witness', /Witness(?:es|\(es\))?\b\s*:?/],
     ['caseName', /Case\s*Name\b\s*:?/],
     ['causeNo', /Case\s*\/?\s*Cause\s*No\.?\s*:?/],
     ['location', /Location\b\s*:?/],
@@ -307,7 +306,7 @@ function parseAssignment(raw){
   // post-processing
   if(out.jobDate){ const m = out.jobDate.match(/\d{1,2}\/\d{1,2}\/\d{2,4}/); if(m) out.jobDate = m[0]; }
   if(out.jobNo){ const m = out.jobNo.match(/\d{3,}/); if(m) out.jobNo = m[0]; }
-  if(out.jobTime){ out.jobTime = out.jobTime.replace(/(AM|PM)(?=[A-Z])/g, '$1 ').trim(); }
+  if(out.jobTime){ out.jobTime = out.jobTime.replace(/(AM|PM)(?=[A-Z])/g, '$1 ').replace(/,\s*(Standard|Daylight)/i,' $1').trim(); }
   if(out.client){
     // keep firm name + address on one line; strip phone/fax lines
     out.clientFull = out.client;
@@ -629,10 +628,11 @@ const DEFAULT_READ_CLOSE =
 "*** If any attorney needs the video in a RUSH or on a specific date, call 800-528-3335 IMMEDIATELY to arrange repository upload or overnight delivery. ***";
 
 let state = store.get('naegli_v1', null) || {
-  settings:{ pre:30, post:30, clientId:'', vg:'Lee Klein',
+  settings:{ pre:30, post:30, clientId:'', vg:'Lee Klein', sender:'schedulingteam@naegeliusa.com',
              readOn:DEFAULT_READ_ON, readBreak:DEFAULT_READ_BREAK, readClose:DEFAULT_READ_CLOSE },
   jobs:[], activeJob:null
 };
+if(!state.settings.sender) state.settings.sender='schedulingteam@naegeliusa.com';
 /* migrate older saved settings to the official statement set */
 if(!state.settings.readBreak){
   state.settings.readOn=DEFAULT_READ_ON;
@@ -751,10 +751,14 @@ function renderAttorneys(){
 $('#parseBtn').addEventListener('click',()=>{
   const raw=$('#pasteBox').value.trim();
   if(!raw){ toast('Paste the assignment email first'); return; }
-  applyParsed(parseAssignment(raw));
+  applyParsed(parseAssignment(raw), raw);
 });
-function applyParsed(p){
-  if(!p.jobNo && !p.caseName){ toast("Couldn't find job fields in that text — check the paste"); return; }
+function applyParsed(p, raw){
+  if(!p.jobNo && !p.caseName){
+    if(raw) $('#pasteBox').value=raw;
+    toast("Couldn't find job fields in that email — raw text loaded in the paste box so you can see what came through");
+    return;
+  }
   let j=job();
   const existing=state.jobs.find(x=>x.jobNo===p.jobNo && p.jobNo);
   if(existing){ state.activeJob=existing.id; j=existing; }
@@ -769,8 +773,14 @@ function applyParsed(p){
   syncDeponents(j);
   j.certDeponent=j.witness; j.certDate=j.jobDate; j.certLocation=j.location;
   save(); renderAll();
-  $('#pasteBox').value='';
-  toast('Job #'+j.jobNo+' imported ✓');
+  const missing=['jobNo','jobDate','caseName','witness','location','orderedBy'].filter(k=>!j[k]);
+  if(missing.length){
+    if(raw) $('#pasteBox').value=raw;
+    toast('Job #'+(j.jobNo||'?')+' imported, but I couldn\'t read: '+missing.join(', ')+' — raw email is in the paste box, fill those fields by hand');
+  }else{
+    $('#pasteBox').value='';
+    toast('Job #'+j.jobNo+' imported ✓ — all fields read');
+  }
 }
 
 /* ---------- Gmail pull ---------- */
@@ -787,20 +797,27 @@ $('#gmailBtn').addEventListener('click',async()=>{
       tc.requestAccessToken();
     });
     toast('Connected — searching…');
-    const q=encodeURIComponent('from:naegeliusa.com subject:"Assignment Notification"');
-    const list=await gfetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${q}&maxResults=8`,token);
-    if(!list.messages||!list.messages.length){ toast('No assignment emails found'); return; }
-    const results=[];
+    const sender=(state.settings.sender||'schedulingteam@naegeliusa.com').trim();
+    const q=encodeURIComponent('from:'+sender);
+    const list=await gfetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${q}&maxResults=20`,token);
+    if(!list.messages||!list.messages.length){ toast('No emails found from '+sender); return; }
+    const results=[]; const seenJobs=new Set();
     for(const m of list.messages){
       const msg=await gfetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${m.id}?format=full`,token);
       const subj=(msg.payload.headers.find(h=>h.name==='Subject')||{}).value||'(no subject)';
       const date=(msg.payload.headers.find(h=>h.name==='Date')||{}).value||'';
-      results.push({subj,date,body:extractBody(msg.payload)});
+      // one entry per job — Gmail returns newest first, so the first message wins
+      const jm=subj.match(/Job\s*(?:No\.?|#)\s*(\d+)/i);
+      const key=jm?jm[1]:('msg-'+m.id);
+      if(seenJobs.has(key)) continue;
+      seenJobs.add(key);
+      results.push({subj,date,jobNo:jm?jm[1]:null,body:extractBody(msg.payload)});
     }
-    $('#gmailResults').innerHTML='<h3 class="sub">Pick an assignment:</h3>'+results.map((r,i)=>
-      `<button class="btn wide" data-gi="${i}" style="text-align:left;font-weight:500;font-size:13.5px">${esc(r.subj)}<br><span class="mutedtxt" style="font-size:11.5px">${esc(r.date)}</span></button>`).join('');
+    $('#gmailResults').innerHTML='<h3 class="sub">Pick an assignment (newest first):</h3>'+results.map((r,i)=>
+      `<button class="btn wide" data-gi="${i}" style="text-align:left;font-weight:500;font-size:13.5px">${r.jobNo?('<b>Job '+esc(r.jobNo)+'</b> — '):''}${esc(r.subj)}<br><span class="mutedtxt" style="font-size:11.5px">${esc(r.date)}</span></button>`).join('');
     $('#gmailResults').querySelectorAll('button').forEach(b=>b.addEventListener('click',()=>{
-      applyParsed(parseAssignment(results[+b.dataset.gi].body));
+      const r=results[+b.dataset.gi];
+      applyParsed(parseAssignment(r.body), r.body);
       $('#gmailResults').innerHTML='';
     }));
   }catch(e){
@@ -1079,10 +1096,11 @@ function tickReadTimes(){
 function renderSettings(){
   $('#s_pre').value=state.settings.pre; $('#s_post').value=state.settings.post;
   $('#s_clientId').value=state.settings.clientId; $('#s_vg').value=state.settings.vg;
+  $('#s_sender').value=state.settings.sender;
   $('#s_readOn').value=state.settings.readOn; $('#s_readBreak').value=state.settings.readBreak;
   $('#s_readClose').value=state.settings.readClose;
 }
-[['s_pre','pre'],['s_post','post'],['s_clientId','clientId'],['s_vg','vg'],
+[['s_pre','pre'],['s_post','post'],['s_clientId','clientId'],['s_vg','vg'],['s_sender','sender'],
  ['s_readOn','readOn'],['s_readBreak','readBreak'],['s_readClose','readClose']].forEach(([id,key])=>{
   document.getElementById(id).addEventListener('input',e=>{ state.settings[key]=e.target.value; save(); });
 });
@@ -1121,7 +1139,6 @@ function downloadBytes(bytes,name){
 function billingData(){
   const j=job();
   const tt=computeTotals(j.log);
-  const useTotals=$('#optTotals').checked;
   let arrival=j.arrival;
   if(arrival && /^\d{2}:\d{2}/.test(arrival)){
     const [hh,mm]=arrival.split(':').map(Number);
@@ -1130,8 +1147,9 @@ function billingData(){
   return {
     jobNo:j.jobNo, jobDate:j.jobDate, videographer:j.videographer||state.settings.vg,
     miles:j.miles, travel:j.travel, arrival, lunch:j.lunch,
-    timeOn: useTotals ? (tt.totalOn?fmtDurWords(tt.totalOn):'') : (tt.firstOn?fmtClockShort(tt.firstOn):''),
-    timeOff:useTotals ? (tt.totalOff?fmtDurWords(tt.totalOff):'') : (tt.finalOff?fmtClockShort(tt.finalOff):''),
+    // always the total time actually spent on / off the record, computed from the log
+    timeOn: tt.totalOn?fmtDurWords(tt.totalOn):'',
+    timeOff:tt.totalOff?fmtDurWords(tt.totalOff):'',
     notes:j.notes, reimb:j.reimb.split('\n').map(s=>s.trim()).filter(Boolean),
     attorneys:j.attorneys, caseName:j.caseName, deponents:j.deponents, log:j.log
   };
