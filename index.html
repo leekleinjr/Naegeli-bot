@@ -961,7 +961,7 @@ $('#addDepBtn').addEventListener('click',()=>{
   const j=job(); if(!j){toast('Create a job first');return;}
   const n=$('#newDepName').value.trim(); if(!n) return;
   j.deponents.push(n); j.witness=j.deponents.join(', ');
-  $('#newDepName').value=''; save(); renderDeps(); renderJobFields();
+  $('#newDepName').value=''; save(); renderDeps(); renderJobFields(); renderReads();
 });
 function renderDeps(){
   const j=job(); const el=$('#depChips');
@@ -970,7 +970,7 @@ function renderDeps(){
   el.querySelectorAll('.pill').forEach(p=>p.addEventListener('click',()=>{
     const j=job();
     if(isOnRecord(j)){ toast('Go off the record before switching deponents'); return; }
-    j.activeDep=+p.dataset.dep; save(); renderDeps(); renderRecord(); updateFab();
+    j.activeDep=+p.dataset.dep; save(); renderDeps(); renderRecord(); renderReads(); updateFab();
   }));
 }
 function isOnRecord(j){
