@@ -60,6 +60,7 @@ table.log input[type=time]{padding:5px;font-size:13.5px;width:auto;}
 #fabTime{display:block;font-size:12px;font-weight:600;color:#fffd;font-variant-numeric:tabular-nums;}
 .read{background:var(--panel2);border:1px solid var(--line);border-left:4px solid var(--accent);border-radius:10px;padding:14px;font-size:17px;line-height:1.65;margin:10px 0;}
 .read .var{color:var(--accent);font-weight:650;}
+.read .cue{color:var(--red);font-weight:800;letter-spacing:.04em;}
 .armed{color:var(--green);font-weight:700;}
 .mutedtxt{color:var(--muted);}
 .recitem{display:flex;align-items:center;gap:8px;background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:8px 10px;margin:6px 0;font-size:13.5px;flex-wrap:wrap;}
@@ -175,15 +176,15 @@ h3.sub{font-size:13px;color:var(--text);margin:14px 0 4px;}
   </div>
 
   <div class="card">
-    <h2>Read-on statement</h2>
+    <h2>Beginning</h2>
     <div class="read" id="readOnBox"></div>
   </div>
   <div class="card">
-    <h2>Read-off statement</h2>
-    <div class="read" id="readOffBox"></div>
+    <h2>Breaks / Lunch</h2>
+    <div class="read" id="readBreakBox"></div>
   </div>
   <div class="card">
-    <h2>Closing statement</h2>
+    <h2>Ending of Depo</h2>
     <div class="read" id="readCloseBox"></div>
   </div>
   <p class="hint">Gold values auto-fill from the job; times tick live. Edit the wording in <b>Setup</b>.</p>
@@ -236,9 +237,9 @@ h3.sub{font-size:13px;color:var(--text);margin:14px 0 4px;}
   <div class="card">
     <h2>Read statements</h2>
     <p class="hint">Placeholders: <code>{DEPONENT} {CASE} {CAUSE} {DATE} {DATE_LONG} {TIME} {LOCATION} {ORDERED_BY} {CLIENT} {VIDEOGRAPHER} {JOB_NO}</code></p>
-    <label class="f">Read-on template</label><textarea id="s_readOn" style="min-height:140px"></textarea>
-    <label class="f">Read-off template</label><textarea id="s_readOff" style="min-height:90px"></textarea>
-    <label class="f">Closing template</label><textarea id="s_readClose" style="min-height:90px"></textarea>
+    <label class="f">Beginning</label><textarea id="s_readOn" style="min-height:160px"></textarea>
+    <label class="f">Breaks / Lunch</label><textarea id="s_readBreak" style="min-height:140px"></textarea>
+    <label class="f">Ending of Depo</label><textarea id="s_readClose" style="min-height:180px"></textarea>
     <button class="btn small" id="resetReads">Reset to defaults</button>
   </div>
   <div class="card">
@@ -602,23 +603,43 @@ const store={
   set(k,v){ try{localStorage.setItem(k,JSON.stringify(v));}catch(e){mem[k]=v;} }
 };
 
+/* Official Naegeli read statements (Video Read On Statements 2021v, rev. June 2021) */
 const DEFAULT_READ_ON =
-"We are now on the record. Today's date is {DATE_LONG}, and the time is {TIME}. "+
-"This begins the video-recorded deposition of {DEPONENT}, taken in the matter of {CASE}, "+
-"Cause Number {CAUSE}. This deposition is being held at {LOCATION}, and was ordered by {ORDERED_BY}. "+
-"My name is {VIDEOGRAPHER}, legal videographer on behalf of NAEGELI Deposition & Trial. "+
-"Will counsel please state their appearances for the record, after which the court reporter will swear in the witness.";
-const DEFAULT_READ_OFF =
-"The time is {TIME}, and we are going off the record.";
+"START RECORDING\n"+
+"1. We are on the record. The time is: {TIME}. The date is: {DATE_LONG}.\n"+
+"2. This is the beginning of the deposition of {DEPONENT}.\n"+
+"3. The case caption is {CASE}.\n"+
+"4. Will counsel introduce yourselves and state whom you represent?\n"+
+"5. The court reporter will now swear in the witness.\n"+
+"6. You may now proceed.";
+const DEFAULT_READ_BREAK =
+"1. Please standby.\n"+
+"2. The time is {TIME}. We are off the record.\n"+
+"3. STOP RECORDING\n"+
+"— after the break —\n"+
+"4. Please standby.\n"+
+"5. START RECORDING\n"+
+"6. We are on the record. The time is: {TIME}.";
 const DEFAULT_READ_CLOSE =
-"The time is {TIME}. This concludes today's video-recorded deposition of {DEPONENT}. "+
-"The original media will be retained by NAEGELI Deposition & Trial. We are off the record.";
+"1. Please standby.\n"+
+"2. This is the end of the deposition of {DEPONENT}. The court reporter will now take the orders for the transcript.\n"+
+"\nWAIT UNTIL THE COURT REPORTER FINISHES, THEN TAKE VIDEO DEPOSITION ORDERS — to the non-scheduling attorney(s): \"Mr./Ms. Attorney, {ORDERED_BY} is getting the video of today's deposition. Would you like to order a copy of today's video?\" (Note their answer on the billing sheet.)\n"+
+"\n3. The time is: {TIME} and we are off the record.\n"+
+"STOP RECORDING\n"+
+"*** If any attorney needs the video in a RUSH or on a specific date, call 800-528-3335 IMMEDIATELY to arrange repository upload or overnight delivery. ***";
 
 let state = store.get('naegli_v1', null) || {
   settings:{ pre:30, post:30, clientId:'', vg:'Lee Klein',
-             readOn:DEFAULT_READ_ON, readOff:DEFAULT_READ_OFF, readClose:DEFAULT_READ_CLOSE },
+             readOn:DEFAULT_READ_ON, readBreak:DEFAULT_READ_BREAK, readClose:DEFAULT_READ_CLOSE },
   jobs:[], activeJob:null
 };
+/* migrate older saved settings to the official statement set */
+if(!state.settings.readBreak){
+  state.settings.readOn=DEFAULT_READ_ON;
+  state.settings.readBreak=DEFAULT_READ_BREAK;
+  state.settings.readClose=DEFAULT_READ_CLOSE;
+  delete state.settings.readOff;
+}
 function save(){ store.set('naegli_v1', state); }
 
 function newJob(data){
@@ -1040,11 +1061,14 @@ function subVars(tpl){
     const rep=k==='{TIME}'?v:'<span class="var">'+esc(v)+'</span>';
     html=html.split(esc(k)).join(rep);
   }
+  // style the recording cues red and keep line breaks
+  html=html.replace(/(START RECORDING|STOP RECORDING)/g,'<span class="cue">$1</span>')
+           .replace(/\n/g,'<br>');
   return html;
 }
 function renderReads(){
   $('#readOnBox').innerHTML=subVars(state.settings.readOn);
-  $('#readOffBox').innerHTML=subVars(state.settings.readOff);
+  $('#readBreakBox').innerHTML=subVars(state.settings.readBreak);
   $('#readCloseBox').innerHTML=subVars(state.settings.readClose);
 }
 function tickReadTimes(){
@@ -1055,16 +1079,16 @@ function tickReadTimes(){
 function renderSettings(){
   $('#s_pre').value=state.settings.pre; $('#s_post').value=state.settings.post;
   $('#s_clientId').value=state.settings.clientId; $('#s_vg').value=state.settings.vg;
-  $('#s_readOn').value=state.settings.readOn; $('#s_readOff').value=state.settings.readOff;
+  $('#s_readOn').value=state.settings.readOn; $('#s_readBreak').value=state.settings.readBreak;
   $('#s_readClose').value=state.settings.readClose;
 }
 [['s_pre','pre'],['s_post','post'],['s_clientId','clientId'],['s_vg','vg'],
- ['s_readOn','readOn'],['s_readOff','readOff'],['s_readClose','readClose']].forEach(([id,key])=>{
+ ['s_readOn','readOn'],['s_readBreak','readBreak'],['s_readClose','readClose']].forEach(([id,key])=>{
   document.getElementById(id).addEventListener('input',e=>{ state.settings[key]=e.target.value; save(); });
 });
 $('#resetReads').addEventListener('click',()=>{
-  state.settings.readOn=DEFAULT_READ_ON; state.settings.readOff=DEFAULT_READ_OFF; state.settings.readClose=DEFAULT_READ_CLOSE;
-  save(); renderSettings(); toast('Read statements reset');
+  state.settings.readOn=DEFAULT_READ_ON; state.settings.readBreak=DEFAULT_READ_BREAK; state.settings.readClose=DEFAULT_READ_CLOSE;
+  save(); renderSettings(); toast('Read statements reset to the official Naegeli wording');
 });
 
 /* ---------- export ---------- */
