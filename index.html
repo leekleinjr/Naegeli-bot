@@ -82,6 +82,7 @@ h3.sub{font-size:13px;color:var(--text);margin:14px 0 4px;}
   <div class="logo">N</div>
   <h1>Job Assistant</h1>
   <select id="jobSelect"></select>
+  <button class="btn small" id="cloudChip" title="Drive sync — tap to connect/sync">☁</button>
   <button class="btn small" id="newJobBtn">+ New</button>
 </header>
 
@@ -212,6 +213,15 @@ h3.sub{font-size:13px;color:var(--text);margin:14px 0 4px;}
     <button class="btn wide" id="expBothBtn">⬇ Export both</button>
   </div>
   <div class="card">
+    <h2>Google Drive auto-sync</h2>
+    <p class="hint">Everything dumps into the <b>Naegeli Job Assistant</b> folder in your Drive automatically: each job as <code>job-#.json</code>, every audio clip as it's captured, and PDFs when you export. On another device, tap the ☁ up top and your jobs load right in. Typing a job number also pulls that job's file from Drive if a newer one exists.</p>
+    <label class="f" style="display:flex;align-items:center;gap:8px">
+      <input type="checkbox" id="s_autoSync" style="width:auto"> Auto-sync on
+    </label>
+    <button class="btn primary wide" id="syncNowBtn">☁ Connect &amp; sync now</button>
+    <div class="hint" id="syncState" style="margin-top:8px"></div>
+  </div>
+  <div class="card">
     <h2>Certificate details</h2>
     <div class="row2">
       <div><label class="f">Deposition of</label><input type="text" id="c_deponent"></div>
@@ -246,7 +256,8 @@ h3.sub{font-size:13px;color:var(--text);margin:14px 0 4px;}
     2. Enable the <b>Gmail API</b> (APIs &amp; Services &rarr; Library).<br>
     3. APIs &amp; Services &rarr; OAuth consent screen &rarr; External &rarr; add yourself as a test user.<br>
     4. Credentials &rarr; Create Credentials &rarr; OAuth client ID &rarr; <b>Web application</b> &rarr; add this app's web address (its "origin", e.g. <code>https://yourname.github.io</code>) under Authorized JavaScript origins.<br>
-    5. Paste the Client ID below. Until then, copy-paste works great.</p>
+    5. Paste the Client ID below. Until then, copy-paste works great.<br><br>
+    The Google sign-in asks for two permissions: read Gmail (to find assignments) and manage <i>files this app creates</i> in Drive (for backups and PDF exports &mdash; it cannot see the rest of your Drive).</p>
     <label class="f">OAuth Client ID</label><input type="text" id="s_clientId" placeholder="xxxx.apps.googleusercontent.com">
     <label class="f">Assignment sender address <span class="hint">(only emails from exactly this address show up)</span></label>
     <input type="text" id="s_sender" placeholder="schedulingteam@naegeliusa.com">
@@ -303,7 +314,10 @@ function parseAssignment(raw){
     if(stop) chunk = chunk.slice(0, stop.index);
     out[found[i].key] = cleanValue(chunk);
   }
-  // post-processing
+  return finishParse(out);
+}
+/* shared cleanup for both the text parser and the HTML-table parser */
+function finishParse(out){
   if(out.jobDate){ const m = out.jobDate.match(/\d{1,2}\/\d{1,2}\/\d{2,4}/); if(m) out.jobDate = m[0]; }
   if(out.jobNo){ const m = out.jobNo.match(/\d{3,}/); if(m) out.jobNo = m[0]; }
   if(out.jobTime){ out.jobTime = out.jobTime.replace(/(AM|PM)(?=[A-Z])/g, '$1 ').replace(/,\s*(Standard|Daylight)/i,' $1').trim(); }
@@ -316,6 +330,12 @@ function parseAssignment(raw){
     out.locationFull = out.location;
     // strip a trailing phone-number-only segment
     out.location = out.location.replace(/,?\s*\(?\d{3}\)?[-. ]\d{3}[-. ]\d{4}\s*$/,'').trim();
+  }
+  // never let boilerplate leak into fields
+  for(const k of Object.keys(out)){
+    if(typeof out[k]==='string'){
+      out[k]=out[k].replace(/\*\*?PLEASE NOTE[\s\S]*$/i,'').replace(/Don'?t forget[\s\S]*$/i,'').trim().replace(/,$/,'');
+    }
   }
   return out;
 }
@@ -633,6 +653,7 @@ let state = store.get('naegli_v1', null) || {
   jobs:[], activeJob:null
 };
 if(!state.settings.sender) state.settings.sender='schedulingteam@naegeliusa.com';
+if(state.settings.autoSync===undefined) state.settings.autoSync=true;
 /* migrate older saved settings to the official statement set */
 if(!state.settings.readBreak){
   state.settings.readOn=DEFAULT_READ_ON;
@@ -640,7 +661,13 @@ if(!state.settings.readBreak){
   state.settings.readClose=DEFAULT_READ_CLOSE;
   delete state.settings.readOff;
 }
-function save(){ store.set('naegli_v1', state); }
+function save(touchJob){
+  if(touchJob!==false){
+    const j=state.jobs.find(x=>x.id===state.activeJob);
+    if(j){ j.modifiedAt=Date.now(); markDirty(j.id); }
+  }
+  store.set('naegli_v1', state);
+}
 
 function newJob(data){
   const j={
@@ -702,6 +729,10 @@ for(const [id,key] of Object.entries(FIELD_MAP)){
     j[key]=e.target.value;
     if(key==='witness'){ syncDeponents(j); renderDeps(); }
     if(key==='jobNo'||key==='caseName') renderJobSelect();
+    if(key==='jobNo'){
+      clearTimeout(jobNoLookupTimer);
+      jobNoLookupTimer=setTimeout(()=>lookupJobNo(e.target.value.trim()).catch(()=>{}),1500);
+    }
     save();
   });
 }
@@ -783,19 +814,64 @@ function applyParsed(p, raw){
   }
 }
 
+/* ---------- Google connection (shared by Gmail pull + Drive sync) ---------- */
+let gToken=null, gTokenTime=0;
+const G_SCOPES='https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/drive.file';
+async function ensureGToken(){
+  if(gToken && Date.now()-gTokenTime < 45*60*1000) return gToken;
+  const cid=(state.settings.clientId||'').trim();
+  if(!cid) throw new Error('Add your Google Client ID in Setup first');
+  await loadScript('https://accounts.google.com/gsi/client');
+  const token=await new Promise((res,rej)=>{
+    const tc=google.accounts.oauth2.initTokenClient({
+      client_id:cid, scope:G_SCOPES,
+      callback:t=>t.access_token?res(t.access_token):rej(t), error_callback:rej
+    });
+    tc.requestAccessToken();
+  });
+  gToken=token; gTokenTime=Date.now();
+  return token;
+}
+
+/* ---------- parse the Naegeli email's HTML table directly (label cell → value cell) ---------- */
+const HTML_LABELS={'resource':'resource','job no':'jobNo','job #':'jobNo','task':'task','job date':'jobDate',
+  'job time':'jobTime','witness':'witness','witnesses':'witness','witness(es)':'witness','case name':'caseName',
+  'case/cause no':'causeNo','case / cause no':'causeNo','cause no':'causeNo','case no':'causeNo',
+  'location':'location','remarks':'remarks','client':'client','contact':'contact','ordered by':'orderedBy'};
+function cellText(cell){
+  const t=document.createElement('div');
+  t.innerHTML=cell.innerHTML.replace(/<br[^>]*>/gi,'\n').replace(/<\/(p|div|tr)>/gi,'\n');
+  return t.textContent;
+}
+function normLabel(s){
+  return s.replace(/ /g,' ').replace(/\s+/g,' ').trim().replace(/[.:]+$/,'').trim().toLowerCase();
+}
+function parseAssignmentHtml(html){
+  const root=document.createElement('div'); root.innerHTML=html;
+  const out={};
+  for(const tr of root.querySelectorAll('tr')){
+    const cells=[...tr.children].filter(c=>c.tagName==='TD'||c.tagName==='TH');
+    for(let i=0;i<cells.length-1;i++){
+      const key=HTML_LABELS[normLabel(cellText(cells[i]))];
+      if(!key || out[key]!==undefined) continue;
+      const vRaw=cellText(cells[i+1]);
+      if(HTML_LABELS[normLabel(vRaw)]!==undefined) continue; // next cell is another label, value truly empty
+      out[key]=cleanValue(vRaw);
+      i++;
+    }
+  }
+  return finishParse(out);
+}
+function htmlToText(html){
+  const div=document.createElement('div');
+  div.innerHTML=html.replace(/<(\/tr|\/p|br|\/div|\/td|\/table|\/h\d)[^>]*>/gi,'$&\n');
+  return div.textContent;
+}
+
 /* ---------- Gmail pull ---------- */
 $('#gmailBtn').addEventListener('click',async()=>{
-  const cid=state.settings.clientId.trim();
-  if(!cid){ toast('Add your Google Client ID in Setup first (or just paste the email)'); return; }
   try{
-    await loadScript('https://accounts.google.com/gsi/client');
-    const token=await new Promise((res,rej)=>{
-      const tc=google.accounts.oauth2.initTokenClient({
-        client_id:cid, scope:'https://www.googleapis.com/auth/gmail.readonly',
-        callback:t=>t.access_token?res(t.access_token):rej(t), error_callback:rej
-      });
-      tc.requestAccessToken();
-    });
+    const token=await ensureGToken();
     toast('Connected — searching…');
     const sender=(state.settings.sender||'schedulingteam@naegeliusa.com').trim();
     const q=encodeURIComponent('from:'+sender);
@@ -811,13 +887,23 @@ $('#gmailBtn').addEventListener('click',async()=>{
       const key=jm?jm[1]:('msg-'+m.id);
       if(seenJobs.has(key)) continue;
       seenJobs.add(key);
-      results.push({subj,date,jobNo:jm?jm[1]:null,body:extractBody(msg.payload)});
+      const bodies=extractBodies(msg.payload);
+      results.push({subj,date,jobNo:jm?jm[1]:null,plain:bodies.plain,html:bodies.html});
     }
     $('#gmailResults').innerHTML='<h3 class="sub">Pick an assignment (newest first):</h3>'+results.map((r,i)=>
       `<button class="btn wide" data-gi="${i}" style="text-align:left;font-weight:500;font-size:13.5px">${r.jobNo?('<b>Job '+esc(r.jobNo)+'</b> — '):''}${esc(r.subj)}<br><span class="mutedtxt" style="font-size:11.5px">${esc(r.date)}</span></button>`).join('');
     $('#gmailResults').querySelectorAll('button').forEach(b=>b.addEventListener('click',()=>{
       const r=results[+b.dataset.gi];
-      applyParsed(parseAssignment(r.body), r.body);
+      const rawTxt=(r.plain&&r.plain.trim())?r.plain:(r.html?htmlToText(r.html):'');
+      let p=null;
+      if(r.html){ try{ p=parseAssignmentHtml(r.html); }catch(e){ console.error('html parse',e); } }
+      if(!p || (!p.jobNo && !p.caseName)) p=parseAssignment(rawTxt);
+      else if(!p.witness && !p.location){
+        // table parse got the basics but little else — merge in what the text parser finds
+        const t=parseAssignment(rawTxt);
+        for(const k of Object.keys(t)) if(!p[k]) p[k]=t[k];
+      }
+      applyParsed(p, rawTxt);
       $('#gmailResults').innerHTML='';
     }));
   }catch(e){
@@ -836,7 +922,7 @@ function b64urlDecode(s){
   for(let i=0;i<bin.length;i++) bytes[i]=bin.charCodeAt(i);
   return new TextDecoder('utf-8').decode(bytes);
 }
-function extractBody(payload){
+function extractBodies(payload){
   let plain='',html='';
   (function walk(p){
     if(!p) return;
@@ -844,11 +930,7 @@ function extractBody(payload){
     if(p.mimeType==='text/html'&&p.body&&p.body.data) html+=b64urlDecode(p.body.data);
     (p.parts||[]).forEach(walk);
   })(payload);
-  if(plain.trim()) return plain;
-  // strip html to text with line breaks at block boundaries
-  const div=document.createElement('div');
-  div.innerHTML=html.replace(/<(\/tr|\/p|br|\/div|\/td|\/table|\/h\d)[^>]*>/gi,'$&\n');
-  return div.textContent;
+  return {plain, html};
 }
 function loadScript(src){
   return new Promise((res,rej)=>{
@@ -1048,17 +1130,20 @@ function encodeWav(f32,rate){
 }
 const recordings=[];
 function addRecording(label,blob){
-  recordings.unshift({label,blob,url:URL.createObjectURL(blob)});
+  const j=job();
+  const fname=((j&&j.jobNo)?(j.jobNo+' '):'')+label.replace(/[^\w\- ]+/g,'').replace(/\s+/g,'_')+'.wav';
+  recordings.unshift({label,blob,fname,uploaded:false,url:URL.createObjectURL(blob)});
   renderRecordings();
   toast('Clip saved: '+label);
+  if(state.settings.autoSync) scheduleSync(); // auto-dump to Drive
 }
 function renderRecordings(){
   $('#recList').innerHTML=recordings.map((r,i)=>`
-    <div class="recitem"><span style="flex:1">${esc(r.label)}</span>
+    <div class="recitem"><span style="flex:1">${r.uploaded?'☁ ':''}${esc(r.label)}</span>
       <audio controls src="${r.url}"></audio>
       <a class="btn small" href="${r.url}" download="${esc(r.label.replace(/[^\w\- ]+/g,'').replace(/\s+/g,'_'))}.wav">⬇</a>
     </div>`).join('');
-  if(recordings.length) $('#recList').insertAdjacentHTML('afterbegin','<p class="hint" style="margin-top:10px">Clips live in memory — download the keepers before closing the page.</p>');
+  if(recordings.length) $('#recList').insertAdjacentHTML('afterbegin','<p class="hint" style="margin-top:10px">Clips upload to Drive automatically once connected (☁ = safely in Drive). If the ☁ up top shows an !, tap it.</p>');
 }
 
 /* ---------- read statements ---------- */
@@ -1097,6 +1182,7 @@ function renderSettings(){
   $('#s_pre').value=state.settings.pre; $('#s_post').value=state.settings.post;
   $('#s_clientId').value=state.settings.clientId; $('#s_vg').value=state.settings.vg;
   $('#s_sender').value=state.settings.sender;
+  $('#s_autoSync').checked=state.settings.autoSync!==false;
   $('#s_readOn').value=state.settings.readOn; $('#s_readBreak').value=state.settings.readBreak;
   $('#s_readClose').value=state.settings.readClose;
 }
@@ -1162,7 +1248,9 @@ async function exportBilling(){
   const j=job(); if(!j){toast('No job selected');return;}
   const PDFLib=await ensurePdfLib();
   const bytes=await buildBillingPdf(PDFLib,b64ToBytes(BILLING_B64),billingData());
-  downloadBytes(bytes,`${j.jobNo||'job'} Billing Sheet + Video Log.pdf`);
+  const name=`${j.jobNo||'job'} Billing Sheet + Video Log.pdf`;
+  downloadBytes(bytes,name);
+  uploadPdfBg(name,bytes);
   toast('Billing sheet + video log exported ✓');
 }
 async function exportCert(){
@@ -1174,8 +1262,158 @@ async function exportCert(){
     location:$('#c_location').value||j.location,
     videographer:j.videographer||state.settings.vg
   });
-  downloadBytes(bytes,`${j.jobNo||'job'} Videographer Certificate.pdf`);
+  const name=`${j.jobNo||'job'} Videographer Certificate.pdf`;
+  downloadBytes(bytes,name);
+  uploadPdfBg(name,bytes);
   toast('Certificate exported ✓');
+}
+
+/* ---------- Google Drive sync ---------- */
+async function driveApi(path,token,opts){
+  const r=await fetch('https://www.googleapis.com/drive/v3/'+path,{...(opts||{}),headers:{Authorization:'Bearer '+token,...((opts&&opts.headers)||{})}});
+  if(!r.ok) throw new Error('Drive error '+r.status);
+  return r.json();
+}
+async function driveFolderId(token){
+  const q=encodeURIComponent("name='Naegeli Job Assistant' and mimeType='application/vnd.google-apps.folder' and trashed=false");
+  const res=await driveApi('files?q='+q+'&fields=files(id,name)',token);
+  if(res.files&&res.files.length) return res.files[0].id;
+  const created=await driveApi('files',token,{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({name:'Naegeli Job Assistant',mimeType:'application/vnd.google-apps.folder'})});
+  return created.id;
+}
+async function driveFindIn(token,folderId,name){
+  const q=encodeURIComponent("name='"+name.replace(/'/g,"\\'")+"' and '"+folderId+"' in parents and trashed=false");
+  const res=await driveApi('files?q='+q+'&fields=files(id,name,modifiedTime)',token);
+  return (res.files&&res.files[0])||null;
+}
+async function driveUpload(token,folderId,name,blob,mime,existingId){
+  const boundary='----naegli'+Math.random().toString(36).slice(2);
+  const meta=existingId?{name}:{name,parents:[folderId]};
+  const body=new Blob([
+    '--'+boundary+'\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n'+JSON.stringify(meta)+'\r\n',
+    '--'+boundary+'\r\nContent-Type: '+mime+'\r\n\r\n', blob, '\r\n--'+boundary+'--'
+  ]);
+  const url='https://www.googleapis.com/upload/drive/v3/files'+(existingId?('/'+existingId):'')+'?uploadType=multipart';
+  const r=await fetch(url,{method:existingId?'PATCH':'POST',
+    headers:{Authorization:'Bearer '+token,'Content-Type':'multipart/related; boundary='+boundary},body});
+  if(!r.ok) throw new Error('Drive upload '+r.status);
+  return r.json();
+}
+/* ---------- automatic sync engine ---------- */
+const syncEng={dirty:new Set(),timer:null,folder:null,running:false};
+function gTokenValid(){ return gToken && Date.now()-gTokenTime < 50*60*1000; }
+function setCloud(st,msg){
+  const c=$('#cloudChip'); if(!c) return;
+  const map={off:['☁','#777'],pending:['☁!','#e6b800'],syncing:['☁…','#7fb2ff'],ok:['☁✓','#2ecc71'],err:['☁!','#e74c3c']};
+  const m=map[st]||map.off;
+  c.textContent=m[0]; c.style.color=m[1];
+  const msgs={off:'Auto-sync is off.',pending:'Changes waiting — tap the ☁ up top to connect.',syncing:'Syncing…',ok:'All synced to Drive.',err:'Sync error — tap the ☁ to retry.'};
+  const el=$('#syncState'); if(el) el.textContent=msg||msgs[st]||'';
+}
+function markDirty(id){
+  if(id) syncEng.dirty.add(id);
+  if(state.settings.autoSync) scheduleSync();
+}
+function scheduleSync(){
+  clearTimeout(syncEng.timer);
+  syncEng.timer=setTimeout(()=>flushSync().catch(e=>{console.error(e);setCloud('err',e.message);}),4000);
+}
+async function flushSync(){
+  if(!state.settings.autoSync){ setCloud('off'); return; }
+  const clipsPending=recordings.some(r=>!r.uploaded);
+  if(!syncEng.dirty.size && !clipsPending){ if(gTokenValid()) setCloud('ok'); return; }
+  if(!gTokenValid()){ setCloud('pending'); return; }
+  if(syncEng.running){ scheduleSync(); return; }
+  syncEng.running=true;
+  try{
+    setCloud('syncing');
+    const token=gToken;
+    if(!syncEng.folder) syncEng.folder=await driveFolderId(token);
+    for(const id of [...syncEng.dirty]){
+      const j=state.jobs.find(x=>x.id===id);
+      if(j){
+        const name='job-'+(j.jobNo||j.id)+'.json';
+        const ex=await driveFindIn(token,syncEng.folder,name);
+        await driveUpload(token,syncEng.folder,name,new Blob([JSON.stringify(j)],{type:'application/json'}),'application/json',ex&&ex.id);
+      }
+      syncEng.dirty.delete(id);
+    }
+    let clipUp=false;
+    for(const r of recordings){
+      if(r.uploaded) continue;
+      await driveUpload(token,syncEng.folder,r.fname,r.blob,'audio/wav');
+      r.uploaded=true; clipUp=true;
+    }
+    if(clipUp) renderRecordings();
+    setCloud('ok');
+  } finally { syncEng.running=false; }
+}
+/* connect (tap) → pull all job files from Drive, newest-wins merge, then push local changes */
+async function connectAndSync(){
+  setCloud('syncing','Connecting to Drive…');
+  const token=await ensureGToken();
+  syncEng.folder=await driveFolderId(token);
+  const q=encodeURIComponent("'"+syncEng.folder+"' in parents and trashed=false and name contains 'job-'");
+  const res=await driveApi('files?q='+q+'&fields=files(id,name,modifiedTime)&pageSize=200',token);
+  let pulled=0;
+  for(const f of (res.files||[])){
+    if(!/^job-.*\.json$/.test(f.name)) continue;
+    let remote=null;
+    try{
+      const rr=await fetch('https://www.googleapis.com/drive/v3/files/'+f.id+'?alt=media',{headers:{Authorization:'Bearer '+token}});
+      if(rr.ok) remote=await rr.json();
+    }catch(e){}
+    if(!remote || !remote.id) continue;
+    const local=state.jobs.find(x=>x.id===remote.id || (remote.jobNo && x.jobNo && x.jobNo===remote.jobNo));
+    if(!local){ state.jobs.push(remote); pulled++; }
+    else if((remote.modifiedAt||0)>(local.modifiedAt||0)){ const keep=local.id; Object.assign(local,remote); local.id=keep; pulled++; }
+    else if((local.modifiedAt||0)>(remote.modifiedAt||0)){ syncEng.dirty.add(local.id); }
+  }
+  // drop the untouched blank starter job once real jobs arrive
+  if(pulled && state.jobs.length>1){
+    state.jobs=state.jobs.filter(j=>j.jobNo||j.caseName||j.log.length||syncEng.dirty.has(j.id));
+    if(!state.jobs.find(j=>j.id===state.activeJob)) state.activeJob=state.jobs[state.jobs.length-1].id;
+  }
+  save(false); renderAll();
+  await flushSync();
+  toast(pulled?('Drive sync ✓ — '+pulled+' job(s) updated'):'Drive sync ✓ — up to date');
+}
+function connectHandler(){ connectAndSync().catch(e=>{console.error(e);setCloud('err',e.message);toast('Sync failed: '+e.message);}); }
+$('#cloudChip').addEventListener('click',connectHandler);
+$('#syncNowBtn').addEventListener('click',connectHandler);
+$('#s_autoSync').addEventListener('change',e=>{
+  state.settings.autoSync=e.target.checked; save(false);
+  setCloud(e.target.checked?(gTokenValid()?'ok':'pending'):'off');
+  if(e.target.checked) scheduleSync();
+});
+/* typing a job number pulls that job's file from Drive if newer */
+let jobNoLookupTimer=null;
+async function lookupJobNo(no){
+  if(!no || !gTokenValid() || !state.settings.autoSync) return;
+  if(!syncEng.folder) syncEng.folder=await driveFolderId(gToken);
+  const f=await driveFindIn(gToken,syncEng.folder,'job-'+no+'.json');
+  if(!f) return;
+  const rr=await fetch('https://www.googleapis.com/drive/v3/files/'+f.id+'?alt=media',{headers:{Authorization:'Bearer '+gToken}});
+  if(!rr.ok) return;
+  const remote=await rr.json();
+  const j=job();
+  if(!j || j.jobNo!==no || !remote || !remote.id) return;
+  if((remote.modifiedAt||0)>(j.modifiedAt||0)){
+    const keep=j.id; Object.assign(j,remote); j.id=keep;
+    save(false); renderAll();
+    toast('Pulled job '+no+' from Drive ✓');
+  }
+}
+/* background PDF upload after export */
+function uploadPdfBg(name,bytes){
+  if(!state.settings.autoSync || !gTokenValid()) return;
+  (async()=>{
+    if(!syncEng.folder) syncEng.folder=await driveFolderId(gToken);
+    const ex=await driveFindIn(gToken,syncEng.folder,name);
+    await driveUpload(gToken,syncEng.folder,name,new Blob([bytes],{type:'application/pdf'}),'application/pdf',ex&&ex.id);
+    toast('☁ '+name+' → Drive');
+  })().catch(e=>console.error('pdf upload',e));
 }
 
 /* ---------- boot ---------- */
@@ -1185,6 +1423,15 @@ function renderAll(){
 if(!state.jobs.length) newJob({});
 renderAll();
 autoArm();
+setCloud(state.settings.autoSync?'pending':'off');
+/* auto-connect Drive/Gmail on the first tap of the session (needs a user gesture for the popup) */
+if(state.settings.autoSync && (state.settings.clientId||'').trim()){
+  const autoConnect=()=>{
+    document.removeEventListener('pointerdown',autoConnect);
+    if(!gTokenValid()) connectAndSync().catch(e=>{console.warn('auto-connect',e);setCloud('pending');});
+  };
+  document.addEventListener('pointerdown',autoConnect);
+}
 </script>
 </body>
 </html>
