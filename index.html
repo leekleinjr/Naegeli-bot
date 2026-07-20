@@ -213,15 +213,6 @@ h3.sub{font-size:13px;color:var(--text);margin:14px 0 4px;}
     <button class="btn wide" id="expBothBtn">⬇ Export both</button>
   </div>
   <div class="card">
-    <h2>Google Drive auto-sync</h2>
-    <p class="hint">Everything dumps into the <b>Naegeli Job Assistant</b> folder in your Drive automatically: each job as <code>job-#.json</code>, every audio clip as it's captured, and PDFs when you export. On another device, tap the ☁ up top and your jobs load right in. Typing a job number also pulls that job's file from Drive if a newer one exists.</p>
-    <label class="f" style="display:flex;align-items:center;gap:8px">
-      <input type="checkbox" id="s_autoSync" style="width:auto"> Auto-sync on
-    </label>
-    <button class="btn primary wide" id="syncNowBtn">☁ Connect &amp; sync now</button>
-    <div class="hint" id="syncState" style="margin-top:8px"></div>
-  </div>
-  <div class="card">
     <h2>Certificate details</h2>
     <div class="row2">
       <div><label class="f">Deposition of</label><input type="text" id="c_deponent"></div>
@@ -263,8 +254,24 @@ h3.sub{font-size:13px;color:var(--text);margin:14px 0 4px;}
     <input type="text" id="s_sender" placeholder="schedulingteam@naegeliusa.com">
   </div>
   <div class="card">
+    <h2>Google Drive auto-sync</h2>
+    <p class="hint">Everything dumps into the <b>Naegeli Job Assistant</b> folder in your Drive automatically — a subfolder per job number holding its <code>job-#.json</code>, its audio clips, and its exported PDFs. On another device, tap the ☁ up top and your jobs load right in. Typing a job number also pulls that job's file from Drive if a newer one exists.</p>
+    <label class="f" style="display:flex;align-items:center;gap:8px">
+      <input type="checkbox" id="s_autoSync" style="width:auto"> Auto-sync on
+    </label>
+    <button class="btn primary wide" id="syncNowBtn">☁ Connect &amp; sync now</button>
+    <div class="hint" id="syncState" style="margin-top:8px"></div>
+  </div>
+  <div class="card">
     <h2>Identity</h2>
     <label class="f">Videographer name (default)</label><input type="text" id="s_vg">
+    <label class="f">Signature (drawn onto the certificate)</label>
+    <input type="file" id="s_sigFile" accept="image/*" style="width:100%;color:var(--muted);font-size:13px">
+    <div id="sigPreviewWrap" style="display:none;margin-top:10px">
+      <img id="sigPreview" alt="signature" style="max-width:240px;max-height:70px;background:#fff;border-radius:8px;padding:6px">
+      <button class="btn small danger" id="sigRemove" style="margin-left:10px">Remove</button>
+    </div>
+    <p class="hint" style="margin-top:8px">Sign white paper with a dark pen, snap a photo or scan it, and upload. It gets placed on the certificate's signature line automatically.</p>
   </div>
   <div class="card">
     <h2>Danger zone</h2>
@@ -584,6 +591,15 @@ async function buildCertPdf(PDFLib, d){
     ln++; // blank line between paragraphs
   }
   // signature
+  if(d.sigBytes){
+    try{
+      const img=await doc.embedPng(d.sigBytes);
+      const maxW=215, maxH=62;
+      const s=Math.min(maxW/img.width, maxH/img.height, 1);
+      const w=img.width*s, h=img.height*s;
+      page.drawImage(img,{x:138, y:H-636.6+2, width:w, height:h});
+    }catch(e){ /* bad image — leave line blank for wet signature */ }
+  }
   page.drawLine({start:{x:129.2,y:H-636.6},end:{x:386.2,y:H-636.6},thickness:1,color:black});
   page.drawText(vg,{x:165.6,y:baseY(23),size:SZ,font,color:black});
   return await doc.save();
@@ -1131,8 +1147,8 @@ function encodeWav(f32,rate){
 const recordings=[];
 function addRecording(label,blob){
   const j=job();
-  const fname=((j&&j.jobNo)?(j.jobNo+' '):'')+label.replace(/[^\w\- ]+/g,'').replace(/\s+/g,'_')+'.wav';
-  recordings.unshift({label,blob,fname,uploaded:false,url:URL.createObjectURL(blob)});
+  const fname=label.replace(/[^\w\- ]+/g,'').replace(/\s+/g,'_')+'.wav';
+  recordings.unshift({label,blob,fname,jobNo:(j&&j.jobNo)||null,uploaded:false,url:URL.createObjectURL(blob)});
   renderRecordings();
   toast('Clip saved: '+label);
   if(state.settings.autoSync) scheduleSync(); // auto-dump to Drive
@@ -1185,11 +1201,50 @@ function renderSettings(){
   $('#s_autoSync').checked=state.settings.autoSync!==false;
   $('#s_readOn').value=state.settings.readOn; $('#s_readBreak').value=state.settings.readBreak;
   $('#s_readClose').value=state.settings.readClose;
+  renderSigPreview();
 }
 [['s_pre','pre'],['s_post','post'],['s_clientId','clientId'],['s_vg','vg'],['s_sender','sender'],
  ['s_readOn','readOn'],['s_readBreak','readBreak'],['s_readClose','readClose']].forEach(([id,key])=>{
   document.getElementById(id).addEventListener('input',e=>{ state.settings[key]=e.target.value; save(); });
 });
+/* signature upload — normalized to a small PNG via canvas, stored in settings */
+$('#s_sigFile').addEventListener('change',e=>{
+  const f=e.target.files&&e.target.files[0]; if(!f) return;
+  const img=new Image();
+  img.onload=()=>{
+    const maxW=600;
+    const s=Math.min(maxW/img.width,1);
+    const cv=document.createElement('canvas');
+    cv.width=Math.round(img.width*s); cv.height=Math.round(img.height*s);
+    cv.getContext('2d').drawImage(img,0,0,cv.width,cv.height);
+    state.settings.signature=cv.toDataURL('image/png');
+    save(false); renderSigPreview();
+    toast('Signature saved — it\'ll be placed on every certificate');
+    URL.revokeObjectURL(img.src);
+  };
+  img.onerror=()=>toast('Couldn\'t read that image — try a JPG or PNG');
+  img.src=URL.createObjectURL(f);
+});
+$('#sigRemove').addEventListener('click',()=>{
+  delete state.settings.signature; save(false); renderSigPreview();
+  $('#s_sigFile').value='';
+  toast('Signature removed — certificates export unsigned');
+});
+function renderSigPreview(){
+  const has=!!state.settings.signature;
+  $('#sigPreviewWrap').style.display=has?'block':'none';
+  if(has) $('#sigPreview').src=state.settings.signature;
+}
+function sigBytes(){
+  const d=state.settings.signature;
+  if(!d) return null;
+  try{
+    const bin=atob(d.split(',')[1]); const bytes=new Uint8Array(bin.length);
+    for(let i=0;i<bin.length;i++) bytes[i]=bin.charCodeAt(i);
+    return bytes;
+  }catch(e){ return null; }
+}
+
 $('#resetReads').addEventListener('click',()=>{
   state.settings.readOn=DEFAULT_READ_ON; state.settings.readBreak=DEFAULT_READ_BREAK; state.settings.readClose=DEFAULT_READ_CLOSE;
   save(); renderSettings(); toast('Read statements reset to the official Naegeli wording');
@@ -1250,7 +1305,7 @@ async function exportBilling(){
   const bytes=await buildBillingPdf(PDFLib,b64ToBytes(BILLING_B64),billingData());
   const name=`${j.jobNo||'job'} Billing Sheet + Video Log.pdf`;
   downloadBytes(bytes,name);
-  uploadPdfBg(name,bytes);
+  uploadPdfBg(name,bytes,j.jobNo);
   toast('Billing sheet + video log exported ✓');
 }
 async function exportCert(){
@@ -1260,11 +1315,12 @@ async function exportCert(){
     deponent:$('#c_deponent').value||j.witness,
     date:$('#c_date').value||j.jobDate,
     location:$('#c_location').value||j.location,
-    videographer:j.videographer||state.settings.vg
+    videographer:j.videographer||state.settings.vg,
+    sigBytes:sigBytes()
   });
   const name=`${j.jobNo||'job'} Videographer Certificate.pdf`;
   downloadBytes(bytes,name);
-  uploadPdfBg(name,bytes);
+  uploadPdfBg(name,bytes,j.jobNo);
   toast('Certificate exported ✓');
 }
 
@@ -1301,7 +1357,23 @@ async function driveUpload(token,folderId,name,blob,mime,existingId){
   return r.json();
 }
 /* ---------- automatic sync engine ---------- */
-const syncEng={dirty:new Set(),timer:null,folder:null,running:false};
+const syncEng={dirty:new Set(),timer:null,folder:null,jobFolders:{},running:false};
+/* per-job subfolder: Naegeli Job Assistant / <job number> / */
+async function driveJobFolder(token,label){
+  label=String(label||'misc');
+  if(syncEng.jobFolders[label]) return syncEng.jobFolders[label];
+  if(!syncEng.folder) syncEng.folder=await driveFolderId(token);
+  const q=encodeURIComponent("name='"+label.replace(/'/g,"\\'")+"' and '"+syncEng.folder+"' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false");
+  const res=await driveApi('files?q='+q+'&fields=files(id,name)',token);
+  let id=(res.files&&res.files[0]&&res.files[0].id)||null;
+  if(!id){
+    const created=await driveApi('files',token,{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({name:label,mimeType:'application/vnd.google-apps.folder',parents:[syncEng.folder]})});
+    id=created.id;
+  }
+  syncEng.jobFolders[label]=id;
+  return id;
+}
 function gTokenValid(){ return gToken && Date.now()-gTokenTime < 50*60*1000; }
 function setCloud(st,msg){
   const c=$('#cloudChip'); if(!c) return;
@@ -1333,16 +1405,19 @@ async function flushSync(){
     for(const id of [...syncEng.dirty]){
       const j=state.jobs.find(x=>x.id===id);
       if(j){
-        const name='job-'+(j.jobNo||j.id)+'.json';
-        const ex=await driveFindIn(token,syncEng.folder,name);
-        await driveUpload(token,syncEng.folder,name,new Blob([JSON.stringify(j)],{type:'application/json'}),'application/json',ex&&ex.id);
+        const label=j.jobNo||j.id;
+        const jf=await driveJobFolder(token,label);
+        const name='job-'+label+'.json';
+        const ex=await driveFindIn(token,jf,name);
+        await driveUpload(token,jf,name,new Blob([JSON.stringify(j)],{type:'application/json'}),'application/json',ex&&ex.id);
       }
       syncEng.dirty.delete(id);
     }
     let clipUp=false;
     for(const r of recordings){
       if(r.uploaded) continue;
-      await driveUpload(token,syncEng.folder,r.fname,r.blob,'audio/wav');
+      const jf=await driveJobFolder(token,r.jobNo||'misc');
+      await driveUpload(token,jf,r.fname,r.blob,'audio/wav');
       r.uploaded=true; clipUp=true;
     }
     if(clipUp) renderRecordings();
@@ -1354,7 +1429,8 @@ async function connectAndSync(){
   setCloud('syncing','Connecting to Drive…');
   const token=await ensureGToken();
   syncEng.folder=await driveFolderId(token);
-  const q=encodeURIComponent("'"+syncEng.folder+"' in parents and trashed=false and name contains 'job-'");
+  // job JSONs live in per-job subfolders (older ones may sit at the root) — search by name app-wide
+  const q=encodeURIComponent("name contains 'job-' and mimeType='application/json' and trashed=false");
   const res=await driveApi('files?q='+q+'&fields=files(id,name,modifiedTime)&pageSize=200',token);
   let pulled=0;
   for(const f of (res.files||[])){
@@ -1391,8 +1467,9 @@ $('#s_autoSync').addEventListener('change',e=>{
 let jobNoLookupTimer=null;
 async function lookupJobNo(no){
   if(!no || !gTokenValid() || !state.settings.autoSync) return;
-  if(!syncEng.folder) syncEng.folder=await driveFolderId(gToken);
-  const f=await driveFindIn(gToken,syncEng.folder,'job-'+no+'.json');
+  const q=encodeURIComponent("name='job-"+no.replace(/'/g,"\\'")+".json' and trashed=false");
+  const res=await driveApi('files?q='+q+'&fields=files(id,name,modifiedTime)&orderBy=modifiedTime desc',gToken);
+  const f=res.files&&res.files[0];
   if(!f) return;
   const rr=await fetch('https://www.googleapis.com/drive/v3/files/'+f.id+'?alt=media',{headers:{Authorization:'Bearer '+gToken}});
   if(!rr.ok) return;
@@ -1405,13 +1482,13 @@ async function lookupJobNo(no){
     toast('Pulled job '+no+' from Drive ✓');
   }
 }
-/* background PDF upload after export */
-function uploadPdfBg(name,bytes){
+/* background PDF upload after export — into the job's subfolder */
+function uploadPdfBg(name,bytes,jobNo){
   if(!state.settings.autoSync || !gTokenValid()) return;
   (async()=>{
-    if(!syncEng.folder) syncEng.folder=await driveFolderId(gToken);
-    const ex=await driveFindIn(gToken,syncEng.folder,name);
-    await driveUpload(gToken,syncEng.folder,name,new Blob([bytes],{type:'application/pdf'}),'application/pdf',ex&&ex.id);
+    const jf=await driveJobFolder(gToken,jobNo||'misc');
+    const ex=await driveFindIn(gToken,jf,name);
+    await driveUpload(gToken,jf,name,new Blob([bytes],{type:'application/pdf'}),'application/pdf',ex&&ex.id);
     toast('☁ '+name+' → Drive');
   })().catch(e=>console.error('pdf upload',e));
 }
